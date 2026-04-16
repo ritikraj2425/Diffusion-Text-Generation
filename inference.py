@@ -2,154 +2,167 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 from train import MaskedDiffusionModel
-
+from tokenizer import MAX_SEQ_LENGTH
+import os
 
 
 def load_tokenizer_full(vocab_file="subword_tokenizer.json"):
     tokenizer = Tokenizer.from_file(vocab_file)
-    vocab = tokenizer.get_vocab()
-    id2word = {int(v): k for k, v in vocab.items()}
+    vocab     = tokenizer.get_vocab()
+    id2word   = {int(v): k for k, v in vocab.items()}
     return tokenizer, vocab, id2word
 
 
+def decode_response(token_ids, tokenizer):
+    """
+    FIX: Use the tokenizer's built-in decode() instead of manual subword joining.
+    The old code tried to clean up '##' markers (WordPiece), but we use BPE.
+    The tokenizer.decode() handles BPE subwords correctly.
+    """
+    # Filter out special tokens
+    special_ids = {
+        tokenizer.token_to_id("[PAD]"),
+        tokenizer.token_to_id("[BOS]"),
+        tokenizer.token_to_id("[EOS]"),
+        tokenizer.token_to_id("[MASK]"),
+        tokenizer.token_to_id("[UNK]"),
+    }
 
-def decode_sequence(seq_tensor, id2word):
-    special_tokens = ["[PAD]", "[BOS]", "[EOS]"]
-    words = []
+    filtered_ids = [tid for tid in token_ids if tid not in special_ids]
 
-    for token_id in seq_tensor.tolist():
-        word = id2word.get(token_id, "[UNK]")
-        if word not in special_tokens:
-            words.append(word)
+    if not filtered_ids:
+        return ""
 
-    return " ".join(words).replace(" ##", "").replace("##", "")
+    # Let the tokenizer handle subword reassembly
+    text = tokenizer.decode(filtered_ids)
+
+    # Light cleanup
+    text = text.strip()
+    # Fix spacing around punctuation
+    for p in [".", ",", "?", "!", "'", ":"]:
+        text = text.replace(f" {p}", p)
+
+    return text
 
 
-def generate_single_response(
-    model,
-    tokenizer,
-    id2word,
+def generate_response(
+    model, tokenizer, id2word,
     prompt,
-    max_response_length=20,
-    sampling_steps=15,
-    temperature=0.7
+    max_response_length=24,   # Was 12 → 24 (longer sequences now)
+    sampling_steps=40,        # Was 25 → 40 (more refinement steps)
+    temperature=0.5,          # Slightly higher than 0.4 for more variety
+    top_k=15                  # Was 10 → 15 (slightly wider sampling)
 ):
     model.eval()
     device = next(model.parameters()).device
 
-    bos_id = tokenizer.token_to_id("[BOS]")
-    eos_id = tokenizer.token_to_id("[EOS]")
+    bos_id  = tokenizer.token_to_id("[BOS]")
+    eos_id  = tokenizer.token_to_id("[EOS]")
     mask_id = tokenizer.token_to_id("[MASK]")
+    pad_id  = tokenizer.token_to_id("[PAD]")
 
-    # Format input
-    formatted_prompt = f"user: {prompt} bot: "
-    input_ids = tokenizer.encode(formatted_prompt).ids
+    formatted = f"user: {prompt.lower().strip()} bot:"
+    input_ids = tokenizer.encode(formatted).ids
 
-    # Create sequence
-    sequence = [bos_id] + input_ids + [mask_id] * max_response_length + [eos_id]
+    # Clamp response length to available space
+    max_resp = min(max_response_length, MAX_SEQ_LENGTH - len(input_ids) - 2)
+    if max_resp <= 0:
+        print("Prompt too long.")
+        return ""
+
+    sequence = [bos_id] + input_ids + [mask_id] * max_resp + [eos_id]
+    sequence += [pad_id] * (MAX_SEQ_LENGTH - len(sequence))
     seq_tensor = torch.tensor([sequence], dtype=torch.long, device=device)
 
-    # Identify mask positions
-    is_masked = (seq_tensor == mask_id).squeeze(0)
-    mask_indices = is_masked.nonzero(as_tuple=True)[0]
-    num_masks = len(mask_indices)
-
-    print(f"\nFormatted Input: '{formatted_prompt}'")
-    print("=" * 60)
+    response_start = 1 + len(input_ids)
+    response_end   = response_start + max_resp
+    mask_indices   = list(range(response_start, response_end))
+    num_masks      = len(mask_indices)
 
     for step in range(1, sampling_steps + 1):
         with torch.no_grad():
             logits = model(seq_tensor)
 
-        # Temperature scaling
-        scaled_logits = logits / max(temperature, 1e-6)
-        probs = F.softmax(scaled_logits, dim=-1)
+        # Top-k filtering — zero out all but top-k logits
+        response_logits = logits[0, mask_indices]  # [num_masks, vocab_size]
+        if top_k > 0:
+            top_k_vals, _ = torch.topk(response_logits, top_k, dim=-1)
+            min_top_k     = top_k_vals[:, -1].unsqueeze(-1)
+            response_logits = response_logits.masked_fill(response_logits < min_top_k, float('-inf'))
 
-        # Sample tokens
-        predicted_ids = torch.multinomial(
-            probs.view(-1, probs.size(-1)), 1
-        ).view(probs.shape[:-1]).squeeze(0)
+        # Temperature scaling and sampling
+        scaled = response_logits / max(temperature, 1e-6)
+        probs  = F.softmax(scaled, dim=-1)
 
-        # Confidence calculation
-        true_probs = F.softmax(logits, dim=-1).squeeze(0)
-        confidences = torch.gather(
-            true_probs, 1, predicted_ids.unsqueeze(1)
-        ).squeeze(1)
+        # At final step use greedy (argmax) for cleaner output
+        if step == sampling_steps:
+            predicted = torch.argmax(probs, dim=-1)
+        else:
+            predicted = torch.multinomial(probs, 1).squeeze(-1)
 
-        # Progressive unmasking schedule
-        target_unmasked_ratio = step / sampling_steps
-        target_unmasked_count = int(num_masks * target_unmasked_ratio)
+        # Confidence for remasking schedule
+        true_probs  = F.softmax(response_logits, dim=-1)
+        confidences = true_probs[torch.arange(num_masks), predicted]
 
-        current_sequence = seq_tensor.squeeze(0).clone()
+        current = seq_tensor.squeeze(0).clone()
+        for i, idx in enumerate(mask_indices):
+            current[idx] = predicted[i]
 
-        # Fill masked positions
-        for idx in mask_indices:
-            current_sequence[idx] = predicted_ids[idx]
-
-        # Remasking low-confidence tokens
+        # Progressive remasking: reveal high-confidence tokens first
         if step < sampling_steps:
-            gen_confidences = confidences[mask_indices]
-            num_to_remask = num_masks - target_unmasked_count
+            target_revealed = int(num_masks * step / sampling_steps)
+            num_remask      = num_masks - target_revealed
+            if num_remask > 0:
+                _, low_idx = torch.topk(confidences, k=num_remask, largest=False)
+                for li in low_idx:
+                    current[mask_indices[li]] = mask_id
 
-            if num_to_remask > 0:
-                _, lowest_conf_rel_indices = torch.topk(
-                    gen_confidences, k=num_to_remask, largest=False
-                )
+        seq_tensor = current.unsqueeze(0)
 
-                lowest_conf_abs_indices = mask_indices[lowest_conf_rel_indices]
-
-                for idx in lowest_conf_abs_indices:
-                    current_sequence[idx] = mask_id
-
-        seq_tensor = current_sequence.unsqueeze(0)
-
-        full_decoded = decode_sequence(seq_tensor.squeeze(0), id2word)
-
-        response_start_idx = 1 + len(input_ids)
-        response_end_idx = response_start_idx + max_response_length
-        response_tensor = seq_tensor[0][response_start_idx:response_end_idx]
-
-        response_decoded = decode_sequence(response_tensor, id2word)
-
-        print(response_decoded)
-
-
-
-    print("\nFinal Generated Output:")
-    print(response_decoded)
-    print("=" * 60)
+    # FIX: Use tokenizer.decode() for proper BPE subword handling
+    response_ids = seq_tensor[0][response_start:response_end].tolist()
+    return decode_response(response_ids, tokenizer)
 
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Running inference on: {device}")
+    print(f"Inference on: {device}\n")
 
     tokenizer, vocab, id2word = load_tokenizer_full()
 
+    # Must match train.py architecture
     model = MaskedDiffusionModel(
         vocab_size=len(vocab),
-        d_model=768,
-        nhead=12,
-        num_layers=12,
-        max_seq_len=128
+        d_model=256, nhead=8, num_layers=6,
+        max_seq_len=MAX_SEQ_LENGTH
     ).to(device)
 
+    ckpt = "diffusion_model_best.pth" if os.path.exists("diffusion_model_best.pth") else "diffusion_model.pth"
     try:
-        model.load_state_dict(torch.load("diffusion_model.pth", map_location=device))
-        print("Model weights loaded successfully.")
+        model.load_state_dict(torch.load(ckpt, map_location=device))
+        print(f"Loaded: {ckpt}\n")
     except Exception as e:
-        print(f"Error loading weights: {e}")
+        print(f"Error: {e}")
         exit()
 
-    # Test prompt
-    my_prompt = "hi"
+    test_prompts = [
+        "hi",
+        "how are you",
+        "what is your name",
+        "tell me a joke",
+        "what do you do for fun",
+        "i had a bad day",
+    ]
 
-    generate_single_response(
-        model,
-        tokenizer,
-        id2word,
-        prompt=my_prompt,
-        max_response_length=20,
-        sampling_steps=15,
-        temperature=0.7
-    )
+    for prompt in test_prompts:
+        response = generate_response(
+            model, tokenizer, id2word,
+            prompt=prompt,
+            max_response_length=24,
+            sampling_steps=40,
+            temperature=0.5,
+            top_k=15
+        )
+        print(f"User : {prompt}")
+        print(f"Bot  : {response}")
+        print("-" * 40)
